@@ -11,7 +11,8 @@ import torch
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.engine import Engine
 from nanochat.checkpoint_manager import load_model
-from nanochat.attn_dump import save_internals
+from nanochat.attn_dump import replay_attention, save_internals_from_capture
+from nanochat.attn_flow import save_flow_from_capture
 
 parser = argparse.ArgumentParser(description='Chat with the model')
 parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|rl")
@@ -21,7 +22,11 @@ parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the mod
 parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
 parser.add_argument('--save-internals', action='store_true', help='Save attention (.attn.bin) and logit probabilities (logits.json) for the conversation on exit/clear')
+parser.add_argument('--save-flow', action='store_true', help='Save the dense-replay attention flow (flow.npz) for the conversation on exit/clear')
+parser.add_argument('--flow-per-layer', action='store_true', help='Also store per-layer flow matrices in flow.npz (large)')
+parser.add_argument('--flow-no-identity', action='store_true', help='Compose raw attention without the per-layer residual/identity term')
 parser.add_argument('--internals-dir', type=str, default='logs/internals', help='Base directory for saved internals (a timestamped subdir is created per conversation)')
+parser.add_argument('--flow-dir', type=str, default=None, help='Base directory for saved flow (default: <internals-dir>/flow, timestamped subdir per conversation)')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 args = parser.parse_args()
 
@@ -49,14 +54,26 @@ print("-" * 50)
 conversation_tokens = [bos]
 assistant_ranges = [] # inclusive (start, end) index ranges of assistant tokens inside conversation_tokens
 save_internals_enabled = args.save_internals
+save_flow_enabled = args.save_flow
 
 def flush_internals():
-    """Replay the conversation and save its internals (if enabled and there is something to save)."""
-    if not save_internals_enabled or not assistant_ranges:
+    """Replay the conversation and save its internals/flow (if enabled and there is something to save)."""
+    if not assistant_ranges or not (save_internals_enabled or save_flow_enabled):
         return
-    out_dir = os.path.join(args.internals_dir, time.strftime("%Y%m%d_%H%M%S"))
-    paths = save_internals(model, conversation_tokens, assistant_ranges, out_dir, tokenizer=tokenizer)
-    print(f"Saved model internals to {out_dir} ({', '.join(os.path.basename(p) for p in paths)})")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    capture, logits = replay_attention(model, conversation_tokens)
+    if save_internals_enabled:
+        out_dir = os.path.join(args.internals_dir, stamp)
+        paths = save_internals_from_capture(capture, logits, conversation_tokens, assistant_ranges, out_dir, tokenizer=tokenizer)
+        print(f"Saved model internals to {out_dir} ({', '.join(os.path.basename(p) for p in paths)})")
+    if save_flow_enabled:
+        flow_base = args.flow_dir if args.flow_dir else os.path.join(args.internals_dir, "flow")
+        flow_dir = os.path.join(flow_base, stamp)
+        path = save_flow_from_capture(
+            capture, conversation_tokens, assistant_ranges, flow_dir, tokenizer=tokenizer,
+            include_identity=not args.flow_no_identity, per_layer=args.flow_per_layer,
+        )
+        print(f"Saved attention flow to {flow_dir} ({os.path.basename(path)})")
 
 while True:
 

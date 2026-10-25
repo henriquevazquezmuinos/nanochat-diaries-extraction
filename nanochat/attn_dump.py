@@ -78,30 +78,50 @@ def sparsify_layer(att, K=ATTN_TOPK):
 
 
 @torch.inference_mode()
-def capture_internals(model, tokens, attn_topk=ATTN_TOPK, logit_positions=()):
+def replay_attention(model, tokens):
     """
-    Replay `tokens` (list[int]) through `model` with attention capture.
-    Returns (attn_bin_bytes, logits_by_pos) where logits_by_pos maps each position in `logit_positions`
-    to its (vocab,) fp32 logits on CPU.
+    Replay `tokens` (list[int]) through `model` with dense attention capture.
+    Returns (capture, logits) where capture is a list (one per layer) of (1, H, T, T) fp32
+    attention weights and logits is (1, T, vocab).
     """
-    cfg = model.config
     device = model.get_device()
     ids = torch.tensor([tokens], dtype=torch.long, device=device)
     capture = []
     logits = model(ids, attn_capture=capture)  # (1, T, vocab)
-    assert len(capture) == cfg.n_layer
-    T, L, H = len(tokens), cfg.n_layer, cfg.n_head
+    assert len(capture) == model.config.n_layer
+    return capture, logits
+
+
+def attention_blob(capture, attn_topk=ATTN_TOPK, free=False):
+    """
+    Pack dense captured attention (list of (1, H, T, T)) into the .attn.bin v1 layout.
+    free=True drops each layer's dense matrix from `capture` as soon as it is sparsified.
+    """
+    T = capture[0].shape[-1]
+    L, H = len(capture), capture[0].shape[1]
     keys, weights, dropped = [], [], []
     for l in range(L):
         k_, w_, d_ = sparsify_layer(capture[l][0], attn_topk)
-        capture[l] = None  # free the dense (H, T, T) matrix as soon as it is sparsified
+        if free:
+            capture[l] = None  # free the dense (H, T, T) matrix as soon as it is sparsified
         keys.append(k_.reshape(-1))
         weights.append(w_.reshape(-1))
         dropped.append(d_.reshape(-1))
     keys = array("H", torch.cat(keys).to(torch.int32).tolist())
     weights = torch.cat(weights).numpy().tobytes()
     dropped = torch.cat(dropped).numpy().tobytes()
-    blob = encode_attn_bin(T, L, H, attn_topk, keys, weights, dropped)
+    return encode_attn_bin(T, L, H, attn_topk, keys, weights, dropped)
+
+
+@torch.inference_mode()
+def capture_internals(model, tokens, attn_topk=ATTN_TOPK, logit_positions=()):
+    """
+    Replay `tokens` (list[int]) through `model` with attention capture.
+    Returns (attn_bin_bytes, logits_by_pos) where logits_by_pos maps each position in `logit_positions`
+    to its (vocab,) fp32 logits on CPU.
+    """
+    capture, logits = replay_attention(model, tokens)
+    blob = attention_blob(capture, attn_topk, free=True)
     logits_by_pos = {p: logits[0, p].float().cpu() for p in logit_positions}
     return blob, logits_by_pos
 
@@ -133,15 +153,17 @@ def logits_record(q, tokens, logits, tokenizer=None, top_n=50):
     }
 
 
-def save_internals(model, tokens, assistant_ranges, out_dir, tokenizer=None, attn_topk=ATTN_TOPK, probs_top_n=50):
+def save_internals_from_capture(capture, logits, tokens, assistant_ranges, out_dir, tokenizer=None,
+                                attn_topk=ATTN_TOPK, probs_top_n=50):
     """
-    Replay the conversation and write conversation.attn.bin, logits.json, tokens.json into out_dir.
+    Write conversation.attn.bin, logits.json, tokens.json into out_dir from an already captured replay.
     assistant_ranges: list of inclusive (start, end) index ranges of assistant tokens inside `tokens`.
     Returns the paths written.
     """
     os.makedirs(out_dir, exist_ok=True)
     positions = assistant_prediction_positions(tokens, assistant_ranges)
-    blob, logits_by_pos = capture_internals(model, tokens, attn_topk, positions)
+    blob = attention_blob(capture, attn_topk)
+    logits_by_pos = {p: logits[0, p].float().cpu() for p in positions}
     attn_path = os.path.join(out_dir, "conversation.attn.bin")
     with open(attn_path, "wb") as f:
         f.write(blob)
@@ -161,3 +183,16 @@ def save_internals(model, tokens, assistant_ranges, out_dir, tokenizer=None, att
             "assistant_ranges": [list(r) for r in assistant_ranges],
         }, f)
     return [attn_path, logits_path, tokens_path]
+
+
+def save_internals(model, tokens, assistant_ranges, out_dir, tokenizer=None, attn_topk=ATTN_TOPK, probs_top_n=50):
+    """
+    Replay the conversation and write conversation.attn.bin, logits.json, tokens.json into out_dir.
+    assistant_ranges: list of inclusive (start, end) index ranges of assistant tokens inside `tokens`.
+    Returns the paths written.
+    """
+    capture, logits = replay_attention(model, tokens)
+    return save_internals_from_capture(
+        capture, logits, tokens, assistant_ranges, out_dir,
+        tokenizer=tokenizer, attn_topk=attn_topk, probs_top_n=probs_top_n,
+    )

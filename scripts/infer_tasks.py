@@ -17,6 +17,9 @@ Notes:
 - --save-attn DIR replays prompt + generated tokens through the model with attention capture (nanochat/attn_dump.py)
   and writes DIR/<task>_<index>/{conversation.attn.bin, tokens.json} per scored example. Example:
   python -m scripts.infer_tasks --source base --model-tag d24 --task arc-easy --n 5 --save-attn logs/attn
+- --save-flow DIR replays the same tokens with dense attention capture and writes the composed token-to-token
+  flow DIR/<task>_<index>/flow.npz (T x T fp16; see nanochat/attn_flow.py). Example:
+  python -m scripts.infer_tasks --source sft --model-tag d24 --task arc-easy --n 50 --save-flow logs/flow
 """
 
 import os
@@ -27,7 +30,8 @@ import torch
 
 from nanochat.common import compute_init, compute_cleanup, autodetect_device_type, print0
 from nanochat.tokenizer import get_tokenizer
-from nanochat.attn_dump import capture_internals, ATTN_TOPK
+from nanochat.attn_dump import replay_attention, attention_blob, ATTN_TOPK
+from nanochat.attn_flow import save_flow_from_capture
 
 from tasks.arc import ARC
 from tasks.mmlu import MMLU
@@ -146,14 +150,14 @@ def letter_logits(model, tokenizer, prompt_ids, letters, letter_prefix):
     return logits.tolist()
 
 
-def save_attention(model, tokenizer, tokens, assistant_start, out_dir, attn_topk):
+def save_attention(capture, tokenizer, tokens, assistant_start, out_dir, attn_topk):
     """
-    Replay prompt + generated tokens through the model with attention capture and write
-    conversation.attn.bin (format: nanochat/attn_dump.py) and tokens.json into out_dir.
-    assistant_start: index of the first generated-side token (for chat: <|assistant_start|>, for base: first completion token).
+    Write conversation.attn.bin (format: nanochat/attn_dump.py) and tokens.json into out_dir from an
+    already captured replay. assistant_start: index of the first generated-side token (for chat:
+    <|assistant_start|>, for base: first completion token).
     """
     os.makedirs(out_dir, exist_ok=True)
-    blob, _ = capture_internals(model, tokens, attn_topk)
+    blob = attention_blob(capture, attn_topk)
     with open(os.path.join(out_dir, "conversation.attn.bin"), "wb") as f:
         f.write(blob)
     with open(os.path.join(out_dir, "tokens.json"), "w") as f:
@@ -187,6 +191,12 @@ def main():
                         help="generate: exact match on the generated text. logits: argmax over the answer-letter logits (multiple choice only)")
     parser.add_argument("--save-attn", type=str, default=None, metavar="DIR",
                         help="Save the attention of every scored example (prompt + generated tokens) under DIR/<task>_<index>/")
+    parser.add_argument("--save-flow", type=str, default=None, metavar="DIR",
+                        help="Save the dense-replay attention flow (flow.npz, T x T fp16) under DIR/<task>_<index>/")
+    parser.add_argument("--flow-per-layer", action="store_true",
+                        help="Also store per-layer flow matrices in flow.npz (L x T x T fp16; large)")
+    parser.add_argument("--flow-no-identity", action="store_true",
+                        help="Compose raw attention without the per-layer residual/identity term")
     parser.add_argument("--attn-topk", type=int, default=ATTN_TOPK, help="Top-K attention weights kept per (layer, head, query) row")
     parser.add_argument("--output", type=str, default=None, help="JSONL file to write one row per example to")
     parser.add_argument("--show", type=int, default=3, help="Print the first N examples in full")
@@ -274,12 +284,24 @@ def main():
             row.update(completion=completion, prediction=prediction, gold=gold, correct=is_correct, skipped=False)
             scored += 1
             correct += int(is_correct)
-            if args.save_attn:
-                attn_dir = os.path.join(args.save_attn, f"{args.task}_{row['index']:06d}")
+            if args.save_attn or args.save_flow:
+                tokens = prompt_ids + gen_tokens
                 # chat: the <|assistant_start|> token is the last prompt token, like chat_cli. base: first completion token
                 assistant_start = len(prompt_ids) - 1 if args.source != "base" else len(prompt_ids)
-                save_attention(model, tokenizer, prompt_ids + gen_tokens, assistant_start, attn_dir, args.attn_topk)
-                row["attn_dir"] = attn_dir
+                capture, _ = replay_attention(model, tokens)
+                if args.save_attn:
+                    attn_dir = os.path.join(args.save_attn, f"{args.task}_{row['index']:06d}")
+                    save_attention(capture, tokenizer, tokens, assistant_start, attn_dir, args.attn_topk)
+                    row["attn_dir"] = attn_dir
+                if args.save_flow:
+                    flow_dir = os.path.join(args.save_flow, f"{args.task}_{row['index']:06d}")
+                    save_flow_from_capture(
+                        capture, tokens, [(assistant_start, len(tokens) - 1)], flow_dir,
+                        tokenizer=tokenizer, include_identity=not args.flow_no_identity,
+                        per_layer=args.flow_per_layer,
+                    )
+                    row["flow_dir"] = flow_dir
+                del capture
 
         if out_file:
             out_file.write(json.dumps(row) + "\n")
