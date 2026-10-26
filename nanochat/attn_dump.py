@@ -153,6 +153,30 @@ def logits_record(q, tokens, logits, tokenizer=None, top_n=50):
     }
 
 
+def logits_payload(logits, tokens, assistant_ranges, tokenizer=None, probs_top_n=50):
+    """JSON-able logits.json payload: top-N logits and softmax probs per predicted assistant token."""
+    positions = assistant_prediction_positions(tokens, assistant_ranges)
+    return {
+        "note": "recomputed by replaying the conversation; top-N entries per predicted assistant token. "
+                "probs are the plain softmax of the logits (temperature 1, no top-k).",
+        "top_n": probs_top_n,
+        "steps": [logits_record(q, tokens, logits[0, q].float().cpu(), tokenizer, probs_top_n) for q in positions],
+    }
+
+
+def save_logits_from_capture(logits, tokens, assistant_ranges, out_dir, tokenizer=None, probs_top_n=50):
+    """
+    Write logits.json into out_dir from an already replayed (*, T, vocab) logits tensor.
+    assistant_ranges: list of inclusive (start, end) index ranges of assistant tokens inside `tokens`.
+    Returns the path written.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    logits_path = os.path.join(out_dir, "logits.json")
+    with open(logits_path, "w") as f:
+        json.dump(logits_payload(logits, tokens, assistant_ranges, tokenizer, probs_top_n), f)
+    return logits_path
+
+
 def save_internals_from_capture(capture, logits, tokens, assistant_ranges, out_dir, tokenizer=None,
                                 attn_topk=ATTN_TOPK, probs_top_n=50):
     """
@@ -161,20 +185,11 @@ def save_internals_from_capture(capture, logits, tokens, assistant_ranges, out_d
     Returns the paths written.
     """
     os.makedirs(out_dir, exist_ok=True)
-    positions = assistant_prediction_positions(tokens, assistant_ranges)
     blob = attention_blob(capture, attn_topk)
-    logits_by_pos = {p: logits[0, p].float().cpu() for p in positions}
     attn_path = os.path.join(out_dir, "conversation.attn.bin")
     with open(attn_path, "wb") as f:
         f.write(blob)
-    logits_path = os.path.join(out_dir, "logits.json")
-    with open(logits_path, "w") as f:
-        json.dump({
-            "note": "recomputed by replaying the conversation; top-N entries per predicted assistant token. "
-                    "probs are the plain softmax of the logits (temperature 1, no top-k).",
-            "top_n": probs_top_n,
-            "steps": [logits_record(q, tokens, logits_by_pos[q], tokenizer, probs_top_n) for q in positions],
-        }, f)
+    logits_path = save_logits_from_capture(logits, tokens, assistant_ranges, out_dir, tokenizer, probs_top_n)
     tokens_path = os.path.join(out_dir, "tokens.json")
     with open(tokens_path, "w") as f:
         json.dump({

@@ -20,6 +20,10 @@ Notes:
 - --save-flow DIR replays the same tokens with dense attention capture and writes the composed token-to-token
   flow DIR/<task>_<index>/flow.npz (T x T fp16; see nanochat/attn_flow.py). Example:
   python -m scripts.infer_tasks --source sft --model-tag d24 --task arc-easy --n 50 --save-flow logs/flow
+- --save-logits DIR writes DIR/<task>_<index>/logits.json: for every generated token, the target token plus the
+  top-N logits and their softmax probabilities (chat_cli-style; see nanochat/attn_dump.py). Uses the same replay
+  as --save-attn / --save-flow. Generated tokens only, so not available with --scoring logits. Example:
+  python -m scripts.infer_tasks --source sft --model-tag d24 --task arc-easy --n 50 --save-logits logs/logits
 """
 
 import os
@@ -30,7 +34,7 @@ import torch
 
 from nanochat.common import compute_init, compute_cleanup, autodetect_device_type, print0
 from nanochat.tokenizer import get_tokenizer
-from nanochat.attn_dump import replay_attention, attention_blob, ATTN_TOPK
+from nanochat.attn_dump import replay_attention, attention_blob, save_logits_from_capture, ATTN_TOPK
 from nanochat.attn_flow import save_flow_from_capture
 
 from tasks.arc import ARC
@@ -193,6 +197,9 @@ def main():
                         help="Save the attention of every scored example (prompt + generated tokens) under DIR/<task>_<index>/")
     parser.add_argument("--save-flow", type=str, default=None, metavar="DIR",
                         help="Save the dense-replay attention flow (flow.npz, T x T fp16) under DIR/<task>_<index>/")
+    parser.add_argument("--save-logits", type=str, default=None, metavar="DIR",
+                        help="Save the top-N logits and softmax probs of every generated token (logits.json) under DIR/<task>_<index>/")
+    parser.add_argument("--logits-top-n", type=int, default=50, help="Top-N tokens per position kept in logits.json")
     parser.add_argument("--flow-per-layer", action="store_true",
                         help="Also store per-layer flow matrices in flow.npz (L x T x T fp16; large)")
     parser.add_argument("--flow-no-identity", action="store_true",
@@ -207,6 +214,8 @@ def main():
     task_cls, task_kwargs, fewshot_split, kind = TASKS[args.task]
     if args.scoring == "logits" and kind != "mc":
         parser.error("--scoring logits is only available for multiple choice tasks")
+    if args.scoring == "logits" and args.save_logits:
+        parser.error("--save-logits needs generated tokens, so it is not available with --scoring logits")
     if args.source == "base":
         shots = 3 if args.shots is None else args.shots
     else:
@@ -284,15 +293,22 @@ def main():
             row.update(completion=completion, prediction=prediction, gold=gold, correct=is_correct, skipped=False)
             scored += 1
             correct += int(is_correct)
-            if args.save_attn or args.save_flow:
+            if args.save_attn or args.save_flow or args.save_logits:
                 tokens = prompt_ids + gen_tokens
                 # chat: the <|assistant_start|> token is the last prompt token, like chat_cli. base: first completion token
                 assistant_start = len(prompt_ids) - 1 if args.source != "base" else len(prompt_ids)
-                capture, _ = replay_attention(model, tokens)
+                capture, logits = replay_attention(model, tokens)
                 if args.save_attn:
                     attn_dir = os.path.join(args.save_attn, f"{args.task}_{row['index']:06d}")
                     save_attention(capture, tokenizer, tokens, assistant_start, attn_dir, args.attn_topk)
                     row["attn_dir"] = attn_dir
+                if args.save_logits:
+                    logits_dir = os.path.join(args.save_logits, f"{args.task}_{row['index']:06d}")
+                    save_logits_from_capture(
+                        logits, tokens, [(assistant_start, len(tokens) - 1)], logits_dir,
+                        tokenizer=tokenizer, probs_top_n=args.logits_top_n,
+                    )
+                    row["logits_dir"] = logits_dir
                 if args.save_flow:
                     flow_dir = os.path.join(args.save_flow, f"{args.task}_{row['index']:06d}")
                     save_flow_from_capture(
@@ -301,7 +317,7 @@ def main():
                         per_layer=args.flow_per_layer,
                     )
                     row["flow_dir"] = flow_dir
-                del capture
+                del capture, logits
 
         if out_file:
             out_file.write(json.dumps(row) + "\n")

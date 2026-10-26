@@ -11,7 +11,7 @@ import torch
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.attn_dump import (
     ATTN_TOPK, SENTINEL, decode_attn_bin, sparsify_layer, capture_internals,
-    save_internals, assistant_prediction_positions,
+    save_internals, save_logits_from_capture, replay_attention, assistant_prediction_positions,
 )
 
 
@@ -135,3 +135,28 @@ def test_save_internals_end_to_end(tmp_path):
 
     with open(out / "tokens.json") as f:
         assert json.load(f)["tokens"] == tokens
+
+
+def test_save_logits_from_capture(tmp_path):
+    model = make_model()
+    tokens = torch.randint(0, 100, (20,)).tolist()
+    ranges = [(6, 15)]
+    capture, logits = replay_attention(model, tokens)
+
+    out = tmp_path / "logits"
+    path = save_logits_from_capture(logits, tokens, ranges, str(out), tokenizer=None, probs_top_n=5)
+    assert path == os.path.join(str(out), "logits.json")
+    with open(path) as f:
+        data = json.load(f)
+    assert data["top_n"] == 5
+    assert [s["position"] for s in data["steps"]] == list(range(5, 15))
+    step = data["steps"][0]
+    assert step["target_token"] == tokens[6]
+    assert len(step["top"]) == 5
+    probs = [t["prob"] for t in step["top"]]
+    assert probs == sorted(probs, reverse=True) and 0 < sum(probs) <= 1 + 1e-5
+
+    # target prob is the plain softmax of the full logit vector at that position
+    ref = torch.softmax(logits[0, 5].float(), dim=-1)
+    assert abs(step["target_prob"] - ref[tokens[6]].item()) < 1e-5
+    assert abs(step["target_logit"] - logits[0, 5, tokens[6]].item()) < 1e-5
